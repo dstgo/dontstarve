@@ -2,48 +2,19 @@ package proc
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/panjf2000/ants/v2"
 	"github.com/shirou/gopsutil/v4/process"
+	"github.com/valyala/bytebufferpool"
+	"golang.org/x/sync/errgroup"
 )
-
-type Options struct {
-	Name    string
-	Args    []string
-	WorkDir string
-	Env     []string
-}
-
-// Option apply option into *Options
-type Option func(*Options)
-
-func WithCommand(name string, args ...string) Option {
-	return func(opt *Options) {
-		opt.Name = name
-		opt.Args = args
-	}
-}
-
-func WithWorkDir(dir string) Option {
-	return func(opt *Options) {
-		opt.WorkDir = dir
-	}
-}
-
-func WithEnv(env map[string]string) Option {
-	return func(opts *Options) {
-		var envs []string
-		for k, v := range env {
-			envs = append(envs, fmt.Sprintf("%s=%s", k, v))
-		}
-		opts.Env = envs
-	}
-}
 
 // NewProc return a new Process
 func NewProc(ctx context.Context, procOptions ...Option) (*Proc, error) {
@@ -53,6 +24,7 @@ func NewProc(ctx context.Context, procOptions ...Option) (*Proc, error) {
 	}
 
 	procCmd := exec.CommandContext(ctx, opts.Name, opts.Args...)
+	newProc := &Proc{cmd: procCmd}
 
 	if len(opts.WorkDir) > 0 {
 		procCmd.Dir = opts.WorkDir
@@ -61,33 +33,61 @@ func NewProc(ctx context.Context, procOptions ...Option) (*Proc, error) {
 		procCmd.Env = opts.Env
 	}
 
-	// create pipe
-	stdin, err := procCmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := procCmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	stderr, err := procCmd.StderrPipe()
-	if err != nil {
-		return nil, err
+	if opts.Stdin {
+		stdin, err := procCmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+		newProc.stdinPipe = stdin
+		newProc.stdinChs = make(map[string]*Stream)
 	}
 
-	newProc := &Proc{
-		cmd:        procCmd,
-		StdinPipe:  stdin,
-		StdoutPipe: stdout,
-		StderrPipe: stderr,
-		options:    opts,
+	if opts.Stdout {
+		stdout, err := procCmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		newProc.stdoutPipe = stdout
+		newProc.stdoutChs = make(map[string]*Stream)
 	}
+
+	if opts.Stderr {
+		stderr, err := procCmd.StderrPipe()
+		if err != nil {
+			return nil, err
+		}
+		newProc.stderrPipe = stderr
+		newProc.stderrChs = make(map[string]*Stream)
+	}
+
+	if opts.Stdin || opts.Stdout || opts.Stderr {
+		group, groupCtx := errgroup.WithContext(ctx)
+		newProc.group = group
+		newProc.ctx = groupCtx
+
+		workerPool, err := ants.NewPool(20, ants.WithNonblocking(true))
+		if err != nil {
+			return nil, err
+		}
+		newProc.workerPool = workerPool
+	}
+
+	if newProc.ctx == nil {
+		newProc.ctx = ctx
+	}
+
+	ctx, cancelFunc := context.WithCancel(newProc.ctx)
+	newProc.ctx = ctx
+	newProc.cancel = cancelFunc
 
 	return newProc, nil
 }
 
 // Proc represent a child process of dontstarve
 type Proc struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// start command
 	cmd *exec.Cmd
 	// running process instance
@@ -100,23 +100,25 @@ type Proc struct {
 	createdAt time.Time
 
 	// process pipe
-	StdinPipe  io.WriteCloser
-	StdoutPipe io.ReadCloser
-	StderrPipe io.ReadCloser
+	stdinMu   sync.Mutex
+	stdinPipe io.WriteCloser
+	stdinChs  map[string]*Stream
+
+	stdoutPipe io.ReadCloser
+	stdoutChs  map[string]*Stream
+
+	stderrPipe io.ReadCloser
+	stderrChs  map[string]*Stream
+
+	// group and pool
+	group      *errgroup.Group
+	workerPool *ants.Pool
+	bufferPool bytebufferpool.Pool
 
 	options Options
 }
 
-// Start starts the process but does not wait for it to complete.
-func (p *Proc) Start() error {
-	err := p.cmd.Start()
-	if err != nil {
-		return err
-	}
-	p.proc = p.cmd.Process
-
-	p.createdAt = time.Now()
-
+func (p *Proc) start() error {
 	pid := p.PID()
 	if pid >= 0 {
 		processInfo, err := process.NewProcess(int32(pid))
@@ -125,7 +127,25 @@ func (p *Proc) Start() error {
 		}
 		p.process = processInfo
 	}
+
+	p.listenStdinPipe(p.ctx)
+	p.listenStdoutPipe(p.ctx)
+	p.listenStderrPipe(p.ctx)
+
 	return nil
+}
+
+// Start starts the process but does not wait for it to complete.
+func (p *Proc) Start() error {
+	// start the process
+	err := p.cmd.Start()
+	if err != nil {
+		return err
+	}
+	p.proc = p.cmd.Process
+	p.createdAt = time.Now()
+
+	return p.start()
 }
 
 // Wait waits for the process to exit and waits for any copying to
@@ -139,13 +159,80 @@ func (p *Proc) Wait() error {
 	return nil
 }
 
+func (p *Proc) close() error {
+	for _, stream := range p.stdinChs {
+		stream.Close()
+	}
+	p.stdinPipe.Close()
+	for _, stream := range p.stdoutChs {
+		stream.Close()
+	}
+	p.stdoutPipe.Close()
+	for _, stream := range p.stderrChs {
+		stream.Close()
+	}
+	p.stderrPipe.Close()
+
+	defer p.workerPool.Release()
+
+	p.cancel()
+
+	if p.options.MaxWaitTime == 0 {
+		return p.group.Wait()
+	}
+
+	done := make(chan error)
+	go func() {
+		done <- p.cmd.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-time.After(p.options.MaxWaitTime):
+		return context.DeadlineExceeded
+	case err := <-done:
+		return err
+	}
+}
+
+// Terminate closed the process with syscall.SIGTERM, should not call concurrently
+func (p *Proc) Terminate() error {
+	if p.proc == nil {
+		return nil
+	}
+
+	closeErr := p.close()
+
+	signalErr := p.Signal(syscall.SIGTERM)
+
+	return errors.Join(closeErr, signalErr)
+}
+
+// Interrupt closed the process with syscall.SIGINT, should not call concurrently
+func (p *Proc) Interrupt() error {
+	if p.proc == nil {
+		return nil
+	}
+
+	closeErr := p.close()
+
+	signalErr := p.Signal(syscall.SIGINT)
+
+	return errors.Join(closeErr, signalErr)
+}
+
 // Kill causes the Process to exit immediately. Kill does not wait until
 // the Process has actually exited
 func (p *Proc) Kill() error {
 	if p.proc == nil {
 		return nil
 	}
-	return p.proc.Kill()
+
+	closeErr := p.close()
+
+	signalErr := p.Signal(syscall.SIGKILL)
+
+	return errors.Join(closeErr, signalErr)
 }
 
 // Signal sends a signal to the Process.

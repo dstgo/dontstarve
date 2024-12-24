@@ -60,8 +60,8 @@ func testProcess(t *testing.T, proc *Proc) {
 	require.NoError(t, err)
 	t.Logf("created at %s", createdAt)
 
-	io.Copy(os.Stdout, proc.StdoutPipe)
-	io.Copy(os.Stderr, proc.StderrPipe)
+	io.Copy(os.Stdout, proc.stdoutPipe)
+	io.Copy(os.Stderr, proc.stderrPipe)
 
 	err = proc.Wait()
 	t.Logf("wait error %v", err)
@@ -125,7 +125,7 @@ func TestNewProcDaemon(t *testing.T) {
 	t.Logf("cmd line %+v", proc.CMDLine())
 
 	go func() {
-		scanner := bufio.NewScanner(proc.StderrPipe)
+		scanner := bufio.NewScanner(proc.stderrPipe)
 		for scanner.Scan() {
 			numFDs, err := proc.NumFDs()
 			require.NoError(t, err)
