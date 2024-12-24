@@ -3,8 +3,11 @@ module github.com/dstgo/dontstarve
 go 1.23.3
 
 require (
+	github.com/panjf2000/ants/v2 v2.10.0
 	github.com/shirou/gopsutil/v4 v4.24.11
 	github.com/stretchr/testify v1.10.0
+	github.com/valyala/bytebufferpool v1.0.0
+	golang.org/x/sync v0.10.0
 )
 
 require (
