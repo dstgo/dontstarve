@@ -24,7 +24,7 @@ func NewProc(ctx context.Context, procOptions ...Option) (*Proc, error) {
 	}
 
 	procCmd := exec.CommandContext(ctx, opts.Name, opts.Args...)
-	newProc := &Proc{cmd: procCmd}
+	newProc := &Proc{cmd: procCmd, options: opts}
 
 	if len(opts.WorkDir) > 0 {
 		procCmd.Dir = opts.WorkDir
@@ -60,17 +60,15 @@ func NewProc(ctx context.Context, procOptions ...Option) (*Proc, error) {
 		newProc.stderrChs = make(map[string]*Stream)
 	}
 
-	if opts.Stdin || opts.Stdout || opts.Stderr {
-		group, groupCtx := errgroup.WithContext(ctx)
-		newProc.group = group
-		newProc.ctx = groupCtx
+	group, groupCtx := errgroup.WithContext(ctx)
+	newProc.group = group
+	newProc.ctx = groupCtx
 
-		workerPool, err := ants.NewPool(20, ants.WithNonblocking(true))
-		if err != nil {
-			return nil, err
-		}
-		newProc.workerPool = workerPool
+	workerPool, err := ants.NewPool(20, ants.WithNonblocking(true))
+	if err != nil {
+		return nil, err
 	}
+	newProc.workerPool = workerPool
 
 	if newProc.ctx == nil {
 		newProc.ctx = ctx
@@ -98,6 +96,7 @@ type Proc struct {
 	state *os.ProcessState
 
 	createdAt time.Time
+	closedAt  time.Time
 
 	// process pipe
 	stdinMu   sync.Mutex
@@ -114,6 +113,7 @@ type Proc struct {
 	group      *errgroup.Group
 	workerPool *ants.Pool
 	bufferPool bytebufferpool.Pool
+	once       sync.Once
 
 	options Options
 }
@@ -156,83 +156,87 @@ func (p *Proc) Wait() error {
 	if err != nil {
 		return err
 	}
-	return nil
+	return p.close()
 }
 
+// close process state
 func (p *Proc) close() error {
-	for _, stream := range p.stdinChs {
-		stream.Close()
-	}
-	p.stdinPipe.Close()
-	for _, stream := range p.stdoutChs {
-		stream.Close()
-	}
-	p.stdoutPipe.Close()
-	for _, stream := range p.stderrChs {
-		stream.Close()
-	}
-	p.stderrPipe.Close()
+	var closeErr error
 
-	defer p.workerPool.Release()
+	p.once.Do(func() {
+		p.closedAt = time.Now()
 
-	p.cancel()
+		if p.options.Stdin {
+			for _, stream := range p.stdinChs {
+				stream.Close()
+			}
+			p.stdinPipe.Close()
+		}
 
-	if p.options.MaxWaitTime == 0 {
-		return p.group.Wait()
+		if p.options.Stdout {
+			for _, stream := range p.stdoutChs {
+				stream.Close()
+			}
+			p.stdoutPipe.Close()
+		}
+
+		if p.options.Stderr {
+			for _, stream := range p.stderrChs {
+				stream.Close()
+			}
+			p.stderrPipe.Close()
+		}
+
+		defer p.workerPool.Release()
+
+		p.cancel()
+
+		if p.options.MaxWaitTime == 0 {
+			closeErr = p.group.Wait()
+			return
+		}
+
+		done := make(chan error)
+		go func() {
+			done <- p.group.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-time.After(p.options.MaxWaitTime):
+			closeErr = context.DeadlineExceeded
+		case err := <-done:
+			closeErr = err
+		}
+	})
+
+	return closeErr
+}
+
+// CloseSig close the process with signal
+func (p *Proc) CloseSig(sig syscall.Signal) error {
+	if p.proc == nil {
+		return nil
 	}
 
-	done := make(chan error)
-	go func() {
-		done <- p.cmd.Wait()
-		close(done)
-	}()
+	closeErr := p.close()
 
-	select {
-	case <-time.After(p.options.MaxWaitTime):
-		return context.DeadlineExceeded
-	case err := <-done:
-		return err
-	}
+	signalErr := p.Signal(sig)
+
+	p.state = p.cmd.ProcessState
+
+	return errors.Join(closeErr, signalErr)
 }
 
 // Terminate closed the process with syscall.SIGTERM, should not call concurrently
 func (p *Proc) Terminate() error {
-	if p.proc == nil {
-		return nil
-	}
-
-	closeErr := p.close()
-
-	signalErr := p.Signal(syscall.SIGTERM)
-
-	return errors.Join(closeErr, signalErr)
-}
-
-// Interrupt closed the process with syscall.SIGINT, should not call concurrently
-func (p *Proc) Interrupt() error {
-	if p.proc == nil {
-		return nil
-	}
-
-	closeErr := p.close()
-
-	signalErr := p.Signal(syscall.SIGINT)
-
-	return errors.Join(closeErr, signalErr)
+	return p.CloseSig(syscall.SIGTERM)
 }
 
 // Kill causes the Process to exit immediately. Kill does not wait until
 // the Process has actually exited
 func (p *Proc) Kill() error {
-	if p.proc == nil {
-		return nil
-	}
-
-	closeErr := p.close()
-
-	signalErr := p.Signal(syscall.SIGKILL)
-
-	return errors.Join(closeErr, signalErr)
+	return p.CloseSig(syscall.SIGKILL)
 }
 
 // Signal sends a signal to the Process.

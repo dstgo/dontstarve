@@ -11,7 +11,7 @@ type Stream = Channel[[]byte]
 
 // StdinPipe return a named stream pipe with stdin
 func (p *Proc) StdinPipe(name string) *Stream {
-	if p.PID() != 0 {
+	if p.PID() != -1 {
 		panic(fmt.Sprintf("bind pipe after process started: %s", name))
 	}
 
@@ -27,7 +27,7 @@ func (p *Proc) StdinPipe(name string) *Stream {
 
 // StdoutPipe return a named stream pipe with stdout
 func (p *Proc) StdoutPipe(name string) *Stream {
-	if p.PID() != 0 {
+	if p.PID() != -1 {
 		panic(fmt.Sprintf("bind pipe after process started: %s", name))
 	}
 
@@ -43,7 +43,7 @@ func (p *Proc) StdoutPipe(name string) *Stream {
 
 // StderrPipe return a named stream pipe with stderr
 func (p *Proc) StderrPipe(name string) *Stream {
-	if p.PID() != 0 {
+	if p.PID() != -1 {
 		panic(fmt.Sprintf("bind pipe after process started: %s", name))
 	}
 
@@ -70,12 +70,10 @@ func (p *Proc) listenStdinPipe(ctx context.Context) {
 					return err
 				}
 
-				closed := stdinCh.Closed()
-				if closed {
+				bs, ok := stdinCh.Recv()
+				if !ok {
 					return nil
 				}
-
-				bs := stdinCh.Recv()
 
 				p.stdinMu.Lock()
 				_, err := p.stdinPipe.Write(bs)
@@ -115,15 +113,18 @@ func (p *Proc) listenOutStream(ctx context.Context, readCloser io.ReadCloser, re
 				return err
 			}
 
+			bs := scanner.Bytes()
+
 			for name, ch := range readChs {
 				// submit into work pool
 				err := p.workerPool.Submit(func() {
 					// copy bytes to keep mem safe
 					buffer := p.bufferPool.Get()
-					_, _ = buffer.Write(scanner.Bytes())
+					_, _ = buffer.Write(bs)
 
 					ch.Send(buffer.Bytes())
 
+					buffer.Reset()
 					p.bufferPool.Put(buffer)
 				})
 
@@ -131,9 +132,8 @@ func (p *Proc) listenOutStream(ctx context.Context, readCloser io.ReadCloser, re
 					return fmt.Errorf("%s: %w", name, err)
 				}
 			}
-
 		}
 
-		return nil
+		return scanner.Err()
 	})
 }

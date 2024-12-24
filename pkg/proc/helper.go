@@ -51,17 +51,17 @@ func (c *Channel[T]) TryRecv() (T, bool) {
 	return v, false
 }
 
-func (c *Channel[T]) Recv() T {
+func (c *Channel[T]) Recv() (T, bool) {
 	var v T
 	if c.closed.Load() {
-		return v
+		return v, false
 	}
 
 	rVal, ok := <-c.ch
 	if !ok {
-		return v
+		return v, false
 	}
-	return rVal
+	return rVal, true
 }
 
 func (c *Channel[T]) Closed() bool {
@@ -76,6 +76,7 @@ func (c *Channel[T]) Close() {
 	c.closed.Locker.Lock()
 	close(c.ch)
 	c.closed.Locker.Unlock()
+	c.closed.Store(true)
 }
 
 // Atomic protect a val Type T with a mutex

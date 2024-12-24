@@ -1,11 +1,7 @@
 package proc
 
 import (
-	"bufio"
 	"context"
-	"io"
-	"os"
-	"syscall"
 	"testing"
 	"time"
 
@@ -60,9 +56,6 @@ func testProcess(t *testing.T, proc *Proc) {
 	require.NoError(t, err)
 	t.Logf("created at %s", createdAt)
 
-	io.Copy(os.Stdout, proc.stdoutPipe)
-	io.Copy(os.Stderr, proc.stderrPipe)
-
 	err = proc.Wait()
 	t.Logf("wait error %v", err)
 
@@ -108,59 +101,80 @@ func TestNewProcOnce(t *testing.T) {
 	}
 }
 
-func TestNewProcDaemon(t *testing.T) {
+func TestKillProcess(t *testing.T) {
+
+	sh := `#!/bin/bash
+
+# Infinite loop
+while true; do
+    # Print the current time
+    echo "Current Time: $(date)"
+
+    # Print system information
+    echo "System Information:"
+    # CPU usage
+    echo "CPU Usage: $(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4"%"}')"
+    # Memory usage
+    mem_info=$(free -m | awk 'NR==2{printf "Memory Usage: %.2f%% (Used: %sMB / Total: %sMB)", $3*100/$2, $3, $2}')
+    echo "$mem_info"
+
+    # Add an empty line for separation
+    echo ""
+
+    # Wait for 1 second
+    sleep 1
+done
+`
 	ctx := context.Background()
-	proc, err := NewProc(
-		ctx,
-		WithCommand("/root/httpserver"),
-		WithWorkDir("/root/"),
+	proc, err := NewProc(ctx,
+		WithCommand("bash", "-c", sh),
 	)
 	require.NoError(t, err)
+	t.Log(proc.Start())
 
-	err = proc.Start()
+	go func() {
+		time.Sleep(5 * time.Second)
+		t.Log(proc.Kill())
+	}()
+
+	t.Log(proc.Wait())
+}
+
+func TestTerminateProcess(t *testing.T) {
+
+	sh := `#!/bin/bash
+
+# Infinite loop
+while true; do
+    # Print the current time
+    echo "Current Time: $(date)"
+
+    # Print system information
+    echo "System Information:"
+    # CPU usage
+    echo "CPU Usage: $(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4"%"}')"
+    # Memory usage
+    mem_info=$(free -m | awk 'NR==2{printf "Memory Usage: %.2f%% (Used: %sMB / Total: %sMB)", $3*100/$2, $3, $2}')
+    echo "$mem_info"
+
+    # Add an empty line for separation
+    echo ""
+
+    # Wait for 1 second
+    sleep 1
+done
+`
+	ctx := context.Background()
+	proc, err := NewProc(ctx,
+		WithCommand("bash", "-c", sh),
+	)
 	require.NoError(t, err)
-
-	t.Logf("pid %d", proc.PID())
-	t.Logf("name %s", proc.Name())
-	t.Logf("cmd line %+v", proc.CMDLine())
+	t.Log(proc.Start())
 
 	go func() {
-		scanner := bufio.NewScanner(proc.stderrPipe)
-		for scanner.Scan() {
-			numFDs, err := proc.NumFDs()
-			require.NoError(t, err)
-			t.Logf("num fds %+v", numFDs)
-
-			threads, err := proc.NumThreads()
-			require.NoError(t, err)
-			t.Logf("num threads %+v", threads)
-
-			connections, err := proc.NumConnections()
-			require.NoError(t, err)
-			t.Logf("num connections %+v", connections)
-
-			memoryInfo, err := proc.MemoryInfo()
-			require.NoError(t, err)
-			t.Logf("memory info: %+v", memoryInfo)
-
-			cpuPercent, err := proc.CPUPercent()
-			require.NoError(t, err)
-			t.Logf("cpu percent: %+v", cpuPercent)
-
-			ioCounters, err := proc.IOCounters()
-			require.NoError(t, err)
-			t.Logf("io counters: %+v", ioCounters)
-			t.Log(scanner.Text())
-		}
+		time.Sleep(5 * time.Second)
+		t.Log(proc.Terminate())
 	}()
 
-	go func() {
-		for range time.After(time.Second * 60) {
-			err := proc.Signal(syscall.SIGTERM)
-			t.Logf("kill err %v", err)
-		}
-	}()
-
-	err = proc.Wait()
-	t.Logf("wait error %v", err)
+	t.Log(proc.Wait())
 }
