@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 )
 
 type Stream = Channel[[]byte]
@@ -115,17 +116,22 @@ func (p *Proc) listenOutStream(ctx context.Context, readCloser io.ReadCloser, re
 
 			bs := scanner.Bytes()
 
-			for name, ch := range readChs {
+			for name, readCh := range readChs {
 				// submit into work pool
 				err := p.workerPool.Submit(func() {
 					// copy bytes to keep mem safe
 					buffer := p.bufferPool.Get()
+					defer p.bufferPool.Put(buffer)
+					buffer.Reset()
+
 					_, _ = buffer.Write(bs)
 
-					ch.Send(buffer.Bytes())
-
-					buffer.Reset()
-					p.bufferPool.Put(buffer)
+					select {
+					case <-ctx.Done():
+					case <-time.After(time.Second * 20):
+					case readCh.ch <- buffer.Bytes():
+					}
+					return
 				})
 
 				if err != nil {
